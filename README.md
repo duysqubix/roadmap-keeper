@@ -1,16 +1,19 @@
 # roadmap-keeper
 
-A Claude Code mod that keeps a project's roadmap current. After a commit, a pull request or a closed bead, it reminds the agent to update the roadmap page that the [`project-roadmap`](https://github.com/duysqubix/skills/tree/main/project-roadmap) skill makes. It speaks only while the roadmap is behind, and once for each new count.
+A Claude Code mod that keeps a project's roadmaps current. After a commit, a pull request or a closed bead, it reminds the agent to update the roadmap page that the [`project-roadmap`](https://github.com/duysqubix/skills/tree/main/project-roadmap) skill makes. It speaks only while a roadmap is behind, and once for each new count.
 
-- **Linking.** The mod links the folder Claude Code started in to one roadmap page. When the agent publishes a page with the `map` icon and a file name like `roadmap.html`, as the skill does, the mod links it. To link a page that already exists, run `/roadmap link <claude.ai artifact URL>`.
+- **Linking.** The mod keeps a list of roadmap pages for the folder Claude Code started in, one per effort. When the agent publishes a page with the `map` icon and a file name like `roadmap.html`, as the skill does, the mod adds it to the list under the page's title. To add a page that already exists, run `/roadmap link <claude.ai artifact URL> [title]`.
+- **This session's roadmap.** Each session works on one roadmap: the one it last published, wrote to through `ArtifactData` or linked, or the one picked with `/roadmap use <n>`. Its milestones count toward that roadmap alone. Until a session has one, its milestones count toward all of them. A compaction or a fork keeps the pick; a new session, a resume and `/clear` start without one.
 - **Milestones.** Each successful `git commit` (not `--amend`), `gh pr create`, `gh pr merge` and `bd close` counts. Quoted text and heredoc bodies don't, so a commit message or a grep pattern is no milestone. A subagent's milestones count too.
-- **The nudge.** After a milestone, the agent reads one line with the tool result: the roadmap's link, how far behind it is, and a cue to update it with the `project-roadmap` skill if the work finished a step or changed the plan. The main agent hears about a subagent's milestones at its next tool call or prompt.
-- **Status line.** It shows `roadmap: N behind` until the roadmap is updated. A write to the linked page through `ArtifactData`, or a republish of it, resets the count.
-- **Pointer.** At startup, resume, `/clear` and compaction, the agent reads where the roadmap is and when to update it, so a long session doesn't lose it.
+- **The nudge.** After a milestone, the agent reads one line with the tool result: the roadmap's title and link, how far behind it is, and a cue to update it with the `project-roadmap` skill if the work finished a step or changed the plan. Before the session has a roadmap, the line lists each one that is behind. The main agent hears about a subagent's milestones at its next tool call or prompt.
+- **Status line.** It shows `roadmap: N behind` for this session's roadmap, or for the furthest behind when the session has none. A write to a page through `ArtifactData`, or a republish of it, resets that page's count.
+- **Pointer.** At startup, resume, `/clear` and compaction, the agent reads the folder's roadmaps, which one this session works on, and when to update them, so a long session doesn't lose them.
 
-`/roadmap` shows the linked roadmap and its count, `/roadmap link <url>` links a page, and `/roadmap unlink` removes the link.
+`/roadmap` lists the roadmaps and their counts. `/roadmap link <url> [title]` adds a page or renames one. `/roadmap use <n>` picks this session's roadmap. `/roadmap unlink [n]` removes the roadmap numbered `n`; without a number, this session's roadmap or the only one.
 
-The link lasts across sessions. Sessions started in the same folder share one roadmap.
+The list lasts across sessions. Sessions started in the same folder share it, and each picks its own roadmap.
+
+The skill builds `roadmap.html` each time, and within one conversation a publish of the same file replaces the page it made before. To start a second effort's roadmap in the same conversation, ask for another file name, such as `kitchen-roadmap.html`.
 
 ## Install
 
