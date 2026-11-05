@@ -1,4 +1,4 @@
 {
   "name": "roadmap-keeper",
-  "description": "Reminds the agent to update the folder's project roadmaps after commits, PRs and closed beads"
+  "description": "Reminds the agent to update a project's roadmaps after commits, PRs and closed beads in its folder"
 }

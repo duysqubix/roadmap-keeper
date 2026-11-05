@@ -8,6 +8,7 @@ const B = 'https://claude.ai/artifact/RoadmapB2'
 const C = 'https://claude.ai/artifact/RoadmapC3'
 const OTHER = 'https://claude.ai/artifact/WellsMap9'
 const CODE = 'https://claude.ai/code/artifact/0b1c2d3e-aaaa-bbbb-cccc-1234567890ab'
+// The page each file publishes, by file name.
 const PAGES: Record<string, string> = {
   'roadmap.html': A,
   'kitchen-roadmap.html': B,
@@ -19,37 +20,62 @@ const FILES: Record<string, string> = {
   'roadmap.html': '<!doctype html><title>App Launch Roadmap</title>',
   'kitchen-roadmap.html': '<title>Kitchen &amp; Bath Roadmap</title>',
 }
-const APP = { url: A, title: 'App Launch Roadmap', behind: 0 }
-const KITCHEN = { url: B, title: 'Kitchen & Bath Roadmap', behind: 0 }
-const KEY = 'roadmaps:/work/app'
-const OLD = 'link:/work/app' // where the first version kept its one link
+const HOME = '/home/me'
+const APP_DIR = '/home/me/app'
+const KITCHEN_DIR = '/home/me/kitchen'
+const TOOL_DIR = '/home/me/.repos/tool'
+const WORKTREE = `${APP_DIR}/.claude/worktrees/agent-1` // a subagent's isolated worktree
+// The repos on this machine, by their .git. The skills library and a worktree are ones too, as on the user's machine.
+const REPOS = new Set(
+  [APP_DIR, KITCHEN_DIR, TOOL_DIR, WORKTREE, '/home/me/other', '/home/me/.agents/skills'].map(d => `${d}/.git`),
+)
+// Where a path lands, as on the user's machine: ~/repos links to ~/.repos, and each skill in ~/.claude/skills to its
+// folder in the skills library.
+const land = (path: string) =>
+  path
+    .replace(/^\/home\/me\/repos(?=\/|$)/, `${HOME}/.repos`)
+    .replace(/^\/home\/me\/\.claude\/skills\//, `${HOME}/.agents/skills/`)
+// Two efforts of the app's repo.
+const APP = { url: A, title: 'App Launch Roadmap', behind: 0, dir: APP_DIR }
+const KITCHEN = { url: B, title: 'Kitchen & Bath Roadmap', behind: 0, dir: APP_DIR }
+const KEY = 'roadmaps'
 
-// Stands for the engine: a store in memory holding `roadmaps` under `key`, every tool answers,
-// a publish prints its page's URL, a file outside FILES is missing, and a Bash command naming FAILS fails.
-const engine = (on: On, roadmaps?: unknown, key = KEY) => {
+// Stands for the engine: a store in memory holding `roadmaps` under `key`, a session started in `root` whose Bash
+// commands start in `shell.cwd`, every tool answers, a publish prints its page's URL, a file outside FILES is
+// missing, and a Bash command naming FAILS fails.
+const engine = (on: On, roadmaps?: unknown, { key = KEY, root = APP_DIR } = {}) => {
   const db = new Map<string, unknown>(roadmaps === undefined ? [] : [[key, roadmaps]])
   const status: (string | undefined)[] = []
   const toasts: string[] = []
+  const shell = { cwd: root } // a test moves it as a `cd` the Bash tool keeps would
+  const base = (path?: string) => path?.split('/').pop() ?? ''
   on('store.get', (_, e) => ({ value: db.get(e.key) }))
   on('store.set', (_, e) => ({ value: void db.set(e.key, e.value) }))
   on('fs.read', (_, e) => {
-    const text = FILES[e.path.split('/').pop() ?? ''] // the engine hands the hook an absolute path
+    const text = FILES[base(e.path)] // the engine hands the hook an absolute path
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: text }
   })
+  on('fs.exists', (_, e) => ({ value: REPOS.has(land(e.path)) }))
+  on('fs.stat', (_, e) => {
+    if (e.path.endsWith('/HEAD')) throw new Error(`ENOENT: ${e.path}`) // `git commit -C HEAD` names a commit, no folder
+    return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false, realPath: land(e.path) } }
+  })
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? HOME : undefined }))
   on('ui.status', (_, e) => ({ value: void status.push(e.text) }))
   on('ui.toast', (_, e) => ({ value: void toasts.push(e.text) }))
-  on('session.root', () => ({ value: '/work/app' }))
+  on('session.root', () => ({ value: root }))
+  on('session.cwd', () => ({ value: shell.cwd }))
   on('command.register', () => ({ value: { command: 'roadmap' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('classic.SessionStart', () => ({}))
   on('classic.UserPromptSubmit', () => ({}))
   on('tool.call', (_, e) => {
-    if (e.tool === 'Artifact') return { result: {}, text: `Published at ${PAGES[e.file_path ?? ''] ?? OTHER}` }
+    if (e.tool === 'Artifact') return { result: {}, text: `Published at ${PAGES[base(e.file_path)] ?? OTHER}` }
     if (e.tool === 'Bash' && e.command.includes('FAILS')) return { result: {}, isError: true }
     return { result: {} }
   })
-  return { db, status, toasts }
+  return { db, status, toasts, shell }
 }
 const run = async ($: Engine, args: string) =>
   (
@@ -60,29 +86,34 @@ const run = async ($: Engine, args: string) =>
       presentation: { isFullscreen: false, columns: 100 },
     })
   ).text
-const start = ($: Engine) =>
-  $.session.start({ cwd: '/work/app/web', surface: 'terminal', isInteractive: true })
+// Starts the session as the engine does, the process and then the startup hook, and resolves the pointer it brought.
+const start = async ($: Engine) => {
+  await $.session.start({ cwd: HOME, surface: 'terminal', isInteractive: true })
+  return (await $.classic.SessionStart({ source: 'startup' })).additionalContext?.[0]
+}
 const counts = (db: Map<string, unknown>) => (db.get(KEY) as { behind: number }[] | undefined)?.map(r => r.behind)
-// A commit in the main loop, and the nudge it brought, if any.
-const commit = async ($: Engine) => (await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).context?.[0]
+// A Bash command in the main loop, and what it told the agent, if anything.
+const bash = async ($: Engine, command: string) => (await $.tool.call({ tool: 'Bash', command })).context
+const commit = async ($: Engine) => (await bash($, 'git commit -m x'))?.[0]
 
-test('a roadmap publish adds it by its title, a commit nudges once, a db write syncs it', async ($, on) => {
+test('a roadmap publish adds it by its title for the repo at hand, a commit nudges once, a db write syncs it', async ($, on) => {
   const { db, status, toasts } = engine(on)
-  await start($)
+  expect(await start($)).toBeUndefined()
 
-  expect((await $.tool.call({ tool: 'Artifact', file_path: 'roadmap.html', icon: 'map' })).context).toBeUndefined()
+  const added = await $.tool.call({ tool: 'Artifact', file_path: 'roadmap.html', icon: 'map' })
+  expect(added.context?.[0]).toContain(`Roadmap "App Launch Roadmap" (${A}) now covers ~/app`)
   expect(db.get(KEY)).toEqual([APP])
-  expect(toasts).toEqual(['Roadmap added: App Launch Roadmap'])
+  expect(toasts).toEqual(['Roadmap added for ~/app: App Launch Roadmap'])
 
-  const nudge = await $.tool.call({ tool: 'Bash', command: 'git add -A && git commit -m "ship"' })
-  expect(nudge.context?.[0]).toContain(`"App Launch Roadmap" (${A}) is 1 milestone(s) behind`)
+  const nudge = await bash($, 'git add -A && git commit -m "ship"')
+  expect(nudge).toEqual([expect.stringContaining(`"App Launch Roadmap" (${A}) is 1 milestone(s) behind`)])
   expect(status.at(-1)).toBe('roadmap: 1 behind')
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context).toBeUndefined()
+  expect(await bash($, 'ls')).toBeUndefined()
 
   await $.tool.call({ tool: 'ArtifactData', action: 'batch', url: A, writes: [] })
   expect(db.get(KEY)).toEqual([APP])
   expect(status.at(-1)).toBeUndefined()
-  expect((await $.tool.call({ tool: 'Bash', command: 'gh pr merge 12' })).context?.[0]).toContain('1 milestone(s)')
+  expect((await bash($, 'gh pr merge 12'))?.[0]).toContain('1 milestone(s)')
 })
 
 test('only a roadmap page with the map icon is added; other map pages leave the list alone', async ($, on) => {
@@ -100,16 +131,16 @@ test('only a roadmap page with the map icon is added; other map pages leave the 
   await $.tool.call({ tool: 'Artifact', file_path: 'wells.html', icon: 'map' })
   await $.tool.call({ tool: 'Artifact', file_path: 'kitchen-roadmap.html', icon: 'map' })
   await $.tool.call({ tool: 'Artifact', file_path: 'q3-roadmap.html', icon: 'map' })
-  expect(db.get(KEY)).toEqual([APP, KITCHEN, { url: C, behind: 0 }])
+  expect(db.get(KEY)).toEqual([APP, KITCHEN, { url: C, behind: 0, dir: APP_DIR }])
   expect(toasts).toEqual([
-    'Roadmap added: App Launch Roadmap',
-    'Roadmap added: Kitchen & Bath Roadmap',
-    `Roadmap added: ${C}`,
+    'Roadmap added for ~/app: App Launch Roadmap',
+    'Roadmap added for ~/app: Kitchen & Bath Roadmap',
+    `Roadmap added for ~/app: ${C}`,
   ])
 })
 
 test('only real milestones count, and only writes to a linked roadmap sync it', async ($, on) => {
-  const { db } = engine(on, [{ url: A, behind: 0 }])
+  const { db } = engine(on, [{ url: A, behind: 0, dir: APP_DIR }])
   await start($)
 
   const commands: [string, number][] = [
@@ -138,18 +169,29 @@ test('only real milestones count, and only writes to a linked roadmap sync it', 
   expect(db.get(KEY)).toEqual([APP])
 })
 
-test("the first version's link loads and stays for sessions still on it; a code/ form link syncs by its url", async ($, on) => {
-  const { db } = engine(on, { url: CODE, behind: 2 }, OLD)
+test("the first version's link loads for the folder the session started in, and stays for sessions still on it", async ($, on) => {
+  const OLD = `link:${APP_DIR}`
+  const { db } = engine(on, { url: CODE, behind: 2 }, { key: OLD })
   await start($)
 
-  expect(await run($, '')).toContain(`1. ${CODE}, 2 behind`)
+  expect(await run($, '')).toContain(`1. ~/app: ${CODE}, 2 behind`)
   await $.tool.call({ tool: 'Artifact', file_path: 'roadmap.html', url: CODE })
   expect(db.get(KEY)).toEqual([APP])
   expect(db.get(OLD)).toEqual({ url: CODE, behind: 2 })
 
   // Emptied, the list stays empty: the old link doesn't come back.
   await run($, 'unlink')
-  expect(await run($, '')).toContain('No roadmap linked to /work/app')
+  expect(await run($, '')).toContain('No roadmap linked yet')
+})
+
+test("the second version's list loads for the folder the session started in", async ($, on) => {
+  const V2 = `roadmaps:${APP_DIR}`
+  const { db } = engine(on, [{ url: A, title: 'App Launch Roadmap', behind: 2 }], { key: V2 })
+  expect(await start($)).toContain('It is 2 milestone(s) behind')
+
+  await commit($)
+  expect(db.get(KEY)).toEqual([{ ...APP, behind: 3 }])
+  expect(db.get(V2)).toEqual([{ url: A, title: 'App Launch Roadmap', behind: 2 }])
 })
 
 test("a subagent's milestone reaches the main loop once: at the next prompt, or by the pointer", async ($, on) => {
@@ -165,7 +207,7 @@ test("a subagent's milestone reaches the main loop once: at the next prompt, or 
   expect(r.additionalContext?.[0]).toContain(A)
   expect(r.additionalContext?.[0]).toContain('2 milestone(s) behind')
   // The pointer already said 2, so the next main-loop call stays quiet.
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context).toBeUndefined()
+  expect(await bash($, 'ls')).toBeUndefined()
 })
 
 test('a sync from another session re-arms the nudge', async ($, on) => {
@@ -177,7 +219,7 @@ test('a sync from another session re-arms the nudge', async ($, on) => {
   expect(await commit($)).toContain('1 milestone(s)')
 })
 
-test('with two roadmaps, milestones count toward both until the session works on one', async ($, on) => {
+test('with two roadmaps in a folder, milestones count toward both until the session works on one', async ($, on) => {
   const { db, status } = engine(on, [APP, KITCHEN])
   await start($)
 
@@ -192,72 +234,237 @@ test('with two roadmaps, milestones count toward both until the session works on
   expect(one).toContain(`Roadmap "Kitchen & Bath Roadmap" (${B}) is 1 milestone(s) behind`)
   expect(one).not.toContain(A)
   expect(counts(db)).toEqual([1, 1])
-  expect(await run($, '')).toContain(`2. "Kitchen & Bath Roadmap" (${B}), 1 behind (this session)`)
+  expect(await run($, '')).toContain(`2. ~/app: "Kitchen & Bath Roadmap" (${B}), 1 behind (this session)`)
 
-  expect(await run($, 'use 1')).toBe(`This session works on "App Launch Roadmap" (${A}).`)
+  expect(await run($, 'use 1')).toBe(`This session works on "App Launch Roadmap" (${A}) in ~/app.`)
   expect(await commit($)).toContain(`"App Launch Roadmap" (${A}) is 2 milestone(s) behind`)
   expect(counts(db)).toEqual([2, 1])
   expect(status.at(-1)).toBe('roadmap: 2 behind')
 
-  // Linking a listed page again renames it and keeps its count.
+  // Linking a listed page again renames it and keeps its count and folder.
   await run($, `link ${A} App launch`)
   expect(db.get(KEY)).toEqual([{ ...APP, title: 'App launch', behind: 2 }, { ...KITCHEN, behind: 1 }])
   expect(status.at(-1)).toBe('roadmap: 2 behind')
 })
 
-test('the pointer lists every roadmap; only a compaction keeps the session on its pick', async ($, on) => {
+test("the pointer lists the folder's roadmaps; only a compaction keeps the session on its pick", async ($, on) => {
   const { status } = engine(on, [{ ...APP, behind: 1 }, KITCHEN])
-  await start($)
   const pointer = async (source: 'startup' | 'compact' | 'clear') =>
     (await $.classic.SessionStart({ source })).additionalContext?.[0]
 
-  const fresh = await pointer('startup')
+  const fresh = await start($)
   expect(fresh).toContain(
-    `This folder has 2 project roadmaps, one per effort: 1. "App Launch Roadmap" (${A}), 1 behind; 2. "Kitchen & Bath Roadmap" (${B}), 0 behind.`,
+    `Folder ~/app has 2 project roadmaps, one per effort: 1. "App Launch Roadmap" (${A}), 1 behind; 2. "Kitchen & Bath Roadmap" (${B}), 0 behind.`,
   )
-  expect(fresh).toContain('until then, milestones count toward all of them')
+  expect(fresh).toContain('until then, milestones there count toward all of them')
 
   await run($, 'use 2')
   expect(status.at(-1)).toBeUndefined()
   expect(await pointer('compact')).toContain(`This session works on "Kitchen & Bath Roadmap" (${B}).`)
-  expect(await pointer('clear')).toContain('until then, milestones count toward all of them')
+  expect(await pointer('clear')).toContain('until then, milestones there count toward all of them')
   // Without a pick, the status line shows the furthest behind again.
   expect(status.at(-1)).toBe('roadmap: 1 behind')
 })
 
 test('a republish that turns a code/ link into a listed url keeps one entry; a malformed entry is dropped', async ($, on) => {
   const { db } = engine(on, [
-    { url: CODE, behind: 2 },
+    { url: CODE, behind: 2, dir: APP_DIR },
     { ...APP, behind: 1 },
-    { title: 'no url', behind: 1 },
-    { url: OTHER, behind: null },
+    { title: 'no url', behind: 1, dir: APP_DIR },
+    { url: OTHER, behind: null, dir: APP_DIR },
+    { url: C, behind: 0, dir: 7 }, // a bad folder: the one the session started in
   ])
   await start($)
 
   expect(await run($, '')).toBe(
-    `Roadmaps for /work/app:\n1. ${CODE}, 2 behind\n2. "App Launch Roadmap" (${A}), 1 behind`,
+    `Roadmaps:\n1. ~/app: ${CODE}, 2 behind\n2. ~/app: "App Launch Roadmap" (${A}), 1 behind\n3. ~/app: ${C}, 0 behind`,
   )
   await $.tool.call({ tool: 'Artifact', file_path: 'roadmap.html', url: CODE })
-  expect(db.get(KEY)).toEqual([APP])
+  expect(db.get(KEY)).toEqual([APP, { url: C, behind: 0, dir: APP_DIR }])
 })
 
 test("/roadmap links with a title, and unlinks the one named, else the session's or the only one", async ($, on) => {
   const { db } = engine(on)
   await start($)
 
-  expect(await run($, '')).toContain('No roadmap linked to /work/app')
-  expect(await run($, `link ${CODE}`)).toContain('Roadmap linked to /work/app')
+  expect(await run($, '')).toContain('No roadmap linked yet')
+  expect(await run($, `link ${CODE}`)).toBe(`Roadmap ${CODE} covers ~/app. This session works on it there.`)
   expect(await run($, `link ${B} Kitchen plan`)).toContain('"Kitchen plan"')
-  expect(db.get(KEY)).toEqual([{ url: CODE, behind: 0 }, { url: B, title: 'Kitchen plan', behind: 0 }])
+  expect(db.get(KEY)).toEqual([
+    { url: CODE, behind: 0, dir: APP_DIR },
+    { url: B, title: 'Kitchen plan', behind: 0, dir: APP_DIR },
+  ])
 
   await run($, 'unlink') // this session's: the one linked last
-  expect(db.get(KEY)).toEqual([{ url: CODE, behind: 0 }])
+  expect(db.get(KEY)).toEqual([{ url: CODE, behind: 0, dir: APP_DIR }])
 
   await run($, `link ${B} Kitchen plan`)
   await $.classic.SessionStart({ source: 'clear' })
   expect(await run($, 'unlink')).toContain('Which one? Run /roadmap unlink <number>.')
   expect(await run($, 'unlink 1')).toContain(CODE)
-  expect(db.get(KEY)).toEqual([{ url: B, title: 'Kitchen plan', behind: 0 }])
+  expect(db.get(KEY)).toEqual([{ url: B, title: 'Kitchen plan', behind: 0, dir: APP_DIR }])
   await run($, 'unlink') // the only one
   expect(db.get(KEY)).toEqual([])
+})
+
+test('a session started in ~ counts each commit toward the roadmaps of the folder it ran in', async ($, on) => {
+  const { db, shell } = engine(on, [APP, { ...KITCHEN, dir: KITCHEN_DIR }], { root: HOME })
+  expect(await start($)).toBeUndefined()
+
+  // The first milestone in a folder brings that folder's pointer, with the count, and nothing more.
+  const first = await bash($, 'git -C ~/app commit -m x')
+  expect(first).toEqual([expect.stringContaining(`Folder ~/app has a project roadmap: "App Launch Roadmap" (${A}).`)])
+  expect(first?.[0]).toContain('It is 1 milestone(s) behind')
+  expect(counts(db)).toEqual([1, 0])
+
+  expect((await bash($, 'cd ~/kitchen && git commit -m y'))?.[0]).toContain('Folder ~/kitchen has a project roadmap')
+  expect(counts(db)).toEqual([1, 1])
+  expect((await bash($, 'R=$HOME/app; git -C "$R" commit -m z'))?.[0]).toContain(`(${A}) is 2 milestone(s) behind`)
+  expect(counts(db)).toEqual([2, 1])
+
+  // The Bash tool kept a `cd`: commands start there now.
+  shell.cwd = KITCHEN_DIR
+  expect(await commit($)).toContain(`(${B}) is 2 milestone(s) behind`)
+  await bash($, 'cd ../app; git commit -m w')
+  expect(counts(db)).toEqual([3, 2])
+
+  // A repo without a roadmap, or no repo at all, counts toward none.
+  expect(await bash($, 'git -C ~/other commit -m v && cd /tmp && git commit -m u')).toBeUndefined()
+  expect(counts(db)).toEqual([3, 2])
+})
+
+test('the deepest roadmap folder wins, and a file tool brings its pointer once', async ($, on) => {
+  const { db } = engine(on, [APP, { url: C, behind: 0, dir: `${APP_DIR}/web` }], { root: HOME })
+  await start($)
+
+  expect((await $.tool.call({ tool: 'Read', file_path: `${APP_DIR}/web/src/main.ts` })).context).toEqual([
+    `Folder ~/app/web has a project roadmap: ${C}. When work there finishes a step, lands a decision or changes the plan, update it with the project-roadmap skill.`,
+  ])
+  expect((await $.tool.call({ tool: 'Read', file_path: `${APP_DIR}/web/index.html` })).context).toBeUndefined()
+
+  await bash($, 'git -C ~/app/web commit -m x')
+  expect(counts(db)).toEqual([0, 1])
+  const edit = await $.tool.call({ tool: 'Edit', file_path: `${APP_DIR}/docs/notes.md`, old_string: 'a', new_string: 'b' })
+  expect(edit.context?.[0]).toContain('Folder ~/app has a project roadmap')
+  await bash($, 'git -C ~/app commit -m y')
+  expect(counts(db)).toEqual([1, 1])
+})
+
+test('a new roadmap covers the repo the session last worked in, past the skill files; /roadmap link moves it', async ($, on) => {
+  const { db, toasts } = engine(on, undefined, { root: HOME })
+  await start($)
+
+  // The agent works in the kitchen repo, reads the router's notes and the skill's example, and writes the page in its
+  // scratchpad. The notes are in ~/.claude, though they land in the skills library's repo.
+  await $.tool.call({ tool: 'Read', file_path: `${KITCHEN_DIR}/plan.md` })
+  await $.tool.call({ tool: 'Read', file_path: `${HOME}/.claude/skills/using-agent-skills/reference/product-management.md` })
+  await $.tool.call({ tool: 'Read', file_path: `${HOME}/.agents/skills/project-roadmap/assets/example-roadmap.json` })
+  await $.tool.call({ tool: 'Write', file_path: '/tmp/scratch/kitchen-roadmap.html', content: '' })
+  const added = await $.tool.call({ tool: 'Artifact', file_path: '/tmp/scratch/kitchen-roadmap.html', icon: 'map' })
+  expect(toasts).toEqual(['Roadmap added for ~/kitchen: Kitchen & Bath Roadmap'])
+  expect(added.context?.[0]).toContain(`/roadmap link ${B} <folder>`)
+  await bash($, 'git -C ~/kitchen commit -m x')
+  expect(db.get(KEY)).toEqual([{ ...KITCHEN, behind: 1, dir: KITCHEN_DIR }])
+
+  // Filed under the wrong folder, it moves with its count.
+  expect(await run($, `link ${B} ~/app`)).toBe(
+    `Roadmap "Kitchen & Bath Roadmap" (${B}) covers ~/app. This session works on it there.`,
+  )
+  expect(db.get(KEY)).toEqual([{ ...KITCHEN, behind: 1 }])
+  await bash($, 'git -C ~/kitchen commit -m y')
+  expect(counts(db)).toEqual([1])
+  await bash($, 'git -C ~/app commit -m z')
+  expect(counts(db)).toEqual([2])
+})
+
+test('a roadmap filed in no repo, like ~, counts only the work outside the repos under it', async ($, on) => {
+  const { db, toasts, shell } = engine(on, undefined, { root: HOME })
+  await start($)
+
+  // Published before the agent worked in a repo, it covers the session's folder, and says what that means.
+  const added = await $.tool.call({ tool: 'Artifact', file_path: 'roadmap.html', icon: 'map' })
+  expect(toasts).toEqual(['Roadmap added for ~: App Launch Roadmap'])
+  expect(added.context?.[0]).toContain("~ is in no repo, so the repos under it don't count toward it.")
+
+  // A repo under it brings no pointer and counts toward nothing here, with a roadmap of its own or without.
+  expect(await bash($, 'git -C ~/other commit -m x')).toBeUndefined()
+  expect(await bash($, 'cd ~/app && git commit -m y')).toBeUndefined()
+  expect(counts(db)).toEqual([0])
+  expect((await bash($, 'cd ~/notes && bd close n-1'))?.[0]).toContain('is 1 milestone(s) behind')
+  expect(counts(db)).toEqual([1])
+
+  shell.cwd = `${HOME}/other`
+  expect((await $.classic.SessionStart({ source: 'clear' })).additionalContext).toBeUndefined()
+  shell.cwd = HOME
+  expect((await $.classic.SessionStart({ source: 'clear' })).additionalContext?.[0]).toContain('Folder ~ has a project roadmap')
+})
+
+test("a worktree inside a repo counts toward the repo's roadmaps", async ($, on) => {
+  const { db, shell } = engine(on, [APP])
+  await start($)
+
+  await $.tool.call({ tool: 'Bash', command: `cd ${WORKTREE} && git commit -m x`, agentId: 'a1' })
+  expect(counts(db)).toEqual([1])
+  shell.cwd = WORKTREE
+  expect((await $.classic.SessionStart({ source: 'clear' })).additionalContext?.[0]).toContain('Folder ~/app has a project roadmap')
+})
+
+test('a folder reached through a symbolic link counts as the folder it lands in', async ($, on) => {
+  const { db, toasts } = engine(on, undefined, { root: HOME })
+  await start($)
+
+  await $.tool.call({ tool: 'Read', file_path: `${HOME}/repos/tool/plan.md` })
+  await $.tool.call({ tool: 'Artifact', file_path: 'roadmap.html', icon: 'map' })
+  expect(toasts).toEqual(['Roadmap added for ~/.repos/tool: App Launch Roadmap'])
+  await bash($, 'cd ~/repos/tool && git commit -m x')
+  await bash($, 'git -C ~/.repos/tool commit -m y')
+  await bash($, 'cd ~/repos/tool && git commit -C HEAD') // a folder that isn't there lands where its parent does
+  expect(counts(db)).toEqual([3])
+
+  // Linked by the link's path, it covers the same folder.
+  expect(await run($, `link ${A} ~/repos/tool`)).toBe(
+    `Roadmap "App Launch Roadmap" (${A}) covers ~/.repos/tool. This session works on it there.`,
+  )
+  expect(db.get(KEY)).toEqual([{ ...APP, behind: 3, dir: TOOL_DIR }])
+})
+
+test('redirections, pipes, line continuations and subshells keep each commit with its folder', async ($, on) => {
+  const { db, status } = engine(on, [APP, { ...KITCHEN, dir: KITCHEN_DIR }], { root: KITCHEN_DIR })
+  await start($)
+
+  // A redirection, or a pipe's later stage, runs with the command before it, so the agent stays in ~/app.
+  await bash($, 'git -C ~/app commit -m x 2>&1 | tail -3')
+  expect(status.at(-1)).toBe('roadmap: 1 behind')
+  await bash($, 'git -C ~/app commit -m y &>/dev/null')
+  expect(status.at(-1)).toBe('roadmap: 2 behind')
+  expect(counts(db)).toEqual([2, 0])
+
+  await bash($, 'git -C ~/app \\\n  commit -m z')
+  expect(counts(db)).toEqual([3, 0])
+  // A subshell's `cd` ends with it: not at a bracket inside it, and not past a redirection after it.
+  await bash($, '(cd ~/app && git pull) && git commit -m w')
+  expect(counts(db)).toEqual([3, 1])
+  await bash($, '(cd ~/app && make) 2>&1 | tail -3; git commit -m v')
+  expect(counts(db)).toEqual([3, 2])
+  await bash($, '(cd ~/app && echo $(pwd) && git commit -m u)')
+  expect(counts(db)).toEqual([4, 2])
+
+  // A pipe's later stage commits where it runs, and `|&` is a pipe too.
+  await bash($, 'git -C ~/app log -1 --format=%B | git commit -F -')
+  expect(counts(db)).toEqual([4, 3])
+  await bash($, 'git -C ~/app commit -m t |& tail -3')
+  expect(status.at(-1)).toBe('roadmap: 5 behind')
+})
+
+test("a roadmap the session moved off doesn't nudge it when another session's milestones grow it", async ($, on) => {
+  const { db } = engine(on, [APP, KITCHEN])
+  await start($)
+
+  await commit($) // toward both: no pick yet
+  await run($, 'use 2')
+  db.set(KEY, [{ ...APP, behind: 5 }, { ...KITCHEN, behind: 1 }])
+  expect(await bash($, 'ls')).toBeUndefined()
+  expect((await $.classic.UserPromptSubmit({ prompt: 'next?' })).additionalContext).toBeUndefined()
+  db.set(KEY, [{ ...APP, behind: 5 }, { ...KITCHEN, behind: 2 }])
+  expect(await bash($, 'ls')).toEqual([expect.stringContaining(`(${B}) is 2 milestone(s) behind`)])
 })
