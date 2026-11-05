@@ -338,7 +338,7 @@ test('the deepest roadmap folder wins, and a file tool brings its pointer once',
   await start($)
 
   expect((await $.tool.call({ tool: 'Read', file_path: `${APP_DIR}/web/src/main.ts` })).context).toEqual([
-    `Folder ~/app/web has a project roadmap: ${C}. When work there finishes a step, lands a decision or changes the plan, update it with the project-roadmap skill.`,
+    `Folder ~/app/web has a project roadmap: ${C}. When work there finishes a step, lands a decision or changes the plan, update it with the project-roadmap skill. Write the roadmap's text for a reader who never saw this work: name each thing in words, not by a code, id or shorthand.`,
   ])
   expect((await $.tool.call({ tool: 'Read', file_path: `${APP_DIR}/web/index.html` })).context).toBeUndefined()
 

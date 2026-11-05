@@ -202,6 +202,8 @@ const behindText = (r: Roadmap) => `${r.behind} milestone(s) behind (commits, PR
 // What filing a roadmap in no repo means, said where it is filed.
 const noRepo = async ($: EngineInterface, r: Roadmap) =>
   (await repoOf($, r.dir)) ? '' : ` ${short(r.dir)} is in no repo, so the repos under it don't count toward it.`
+// Closes every pointer and nudge: people read the page cold, so codes like D1 and shorthand mean nothing to them.
+const PLAIN = " Write the roadmap's text for a reader who never saw this work: name each thing in words, not by a code, id or shorthand."
 // What the agent reads when it starts working in a roadmap folder: its roadmaps, this session's one, when to update.
 const pointer = (maps: Roadmap[], mine: Roadmap[]) => {
   const [one, ...more] = mine
@@ -209,7 +211,8 @@ const pointer = (maps: Roadmap[], mine: Roadmap[]) => {
   if (one && !more.length)
     return (
       `Folder ${where} has a project roadmap: ${name(one)}. When work there finishes a step, lands a decision or changes the plan, update it with the project-roadmap skill.` +
-      (one.behind > 0 ? ` It is ${behindText(one)}.` : '')
+      (one.behind > 0 ? ` It is ${behindText(one)}.` : '') +
+      PLAIN
     )
   const pick = mine.find(r => r.url === picks.get(r.dir))
   return (
@@ -217,14 +220,18 @@ const pointer = (maps: Roadmap[], mine: Roadmap[]) => {
     'When work there finishes a step, lands a decision or changes the plan, update the one it belongs to with the project-roadmap skill. ' +
     (pick
       ? `This session works on ${name(pick)}.`
-      : "The first one you update becomes this session's roadmap there; until then, milestones there count toward all of them.")
+      : "The first one you update becomes this session's roadmap there; until then, milestones there count toward all of them.") +
+    PLAIN
   )
 }
 const nudge = (due: Roadmap[]) => {
   const [one, ...more] = due
-  return one && !more.length
-    ? `Roadmap ${name(one)} is ${behindText(one)}. If this work finished a step or changed the plan, update it with the project-roadmap skill; otherwise carry on.`
-    : `These roadmaps are behind by the milestones since each one's last update: ${due.map(line).join('; ')}. If this work finished a step or changed the plan of one, update that one with the project-roadmap skill, and it becomes this session's roadmap in its folder; otherwise carry on.`
+  return (
+    (one && !more.length
+      ? `Roadmap ${name(one)} is ${behindText(one)}. If this work finished a step or changed the plan, update it with the project-roadmap skill; otherwise carry on.`
+      : `These roadmaps are behind by the milestones since each one's last update: ${due.map(line).join('; ')}. If this work finished a step or changed the plan of one, update that one with the project-roadmap skill, and it becomes this session's roadmap in its folder; otherwise carry on.`) +
+    PLAIN
+  )
 }
 // The nudge for the roadmaps that grew since the main loop last heard, among those this session's milestones counted
 // toward and still count toward, if any.
