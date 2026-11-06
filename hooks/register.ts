@@ -246,13 +246,166 @@ const news = (maps: Roadmap[]) => {
   return due.length ? nudge(due) : undefined
 }
 
+// Agents at work: while a session works on a roadmap, the mod keeps a row per agent in the page's `agents` collection,
+// and the page draws each one as a ring and a name tag in its color on the step it works on. The main loop's row is
+// named for the roadmap's folder and sits at the step the session last marked active, or at the You-are-here step
+// when it marked none. A helper's (a subagent's) row is named for its type, takes its parent's color and follows its
+// parent. A row comes with a turn's first tool call and goes when the turn ends and no helper still works: the
+// session's end is too late, as ArtifactData calls stall there until its time runs out (seen live). A tool call that
+// writes a row waits for it, a few tenths of a second, and the mod OKs those writes itself, at tool.check: its own
+// rows on the pages in the list, nothing else.
+type Row = { id: string; ver: number }
+type Spot = Row & { url: string; color: number; step: string | null; seen: number }
+type Doc = { id: string; version: number; data: { name?: unknown; color?: unknown; seen?: unknown; parent?: unknown } }
+type DataInput = Omit<Extract<Parameters<EngineInterface['tool']['call']>[0], { tool: 'ArtifactData' }>, 'tool'>
+const AGENTS = 'agents'
+const LIVE = 30 * 60_000 // a row not seen for this long is gone; the page template hides it after the same time
+const FRESH = 10 * 60_000 // how often a working session's row says it is still there
+let spot: Spot | undefined // this session's row
+const helpers = new Map<string, Row>() // per helper's agentId, its row
+let away: string | undefined // the roadmap folder a helper last worked in, for a main loop that works in none
+let off = false // a row call failed this turn (no ArtifactData tool, a refusal, an error): the rows wait for the next
+let busy = false // the main loop is in a turn
+let last: { url: string; step: string | null } | undefined // the step of the row the last turn left
+let queue: Promise<unknown> = Promise.resolve()
+
+// Runs the mod's row writes one at a time, ten seconds at most each, so a stalled call holds no tool call up for long.
+// Each hook awaits its own: a call this mod makes after its hook returned is raised with every hook of the mod
+// skipped, its OK at tool.check included (seen live).
+function later($: EngineInterface, task: () => Promise<unknown>) {
+  return (queue = queue.then(() => Promise.race([task(), $.clock.sleep(10_000)])).catch(() => undefined))
+}
+const version = (r?: { result?: unknown }) => (r?.result as { db_write?: { version?: number } } | undefined)?.db_write?.version
+// The rows of a list result: the tool prints each as one JSON line between fence lines. Rows are anyone's data.
+const docs = (text = '') =>
+  text.split('\n').flatMap(l => {
+    try {
+      const d = JSON.parse(l) as Doc | null
+      return typeof d?.id === 'string' && typeof d.version === 'number' && d.data ? [d] : []
+    } catch {
+      return []
+    }
+  })
+// The step a write to page `url` makes this session's: the one it set active; null once it sets the session's step
+// to any other status or deletes it; undefined when it says nothing about either.
+const stepOf = (e: ToolCallInput, url: string, step: string | null) => {
+  if (e.tool !== 'ArtifactData' || urlIn(e.url) !== url) return undefined
+  const writes = e.action === 'batch' ? (e.writes ?? []) : [{ ...e, op: e.action }]
+  let out: string | null | undefined
+  for (const w of writes) {
+    if ((w.collection !== 'steps' && w.collection !== 'phases') || !w.doc_id) continue
+    const status = (w.data as { status?: unknown } | undefined)?.status
+    if (w.op !== 'delete' && status === 'active') out = w.doc_id
+    else if (w.doc_id === (out ?? step) && (w.op === 'delete' || status !== undefined)) out = null
+  }
+  return out
+}
+
+// One ArtifactData call of this mod's: its answer, or undefined when it failed, which pauses the rows until the main
+// loop's next turn (a view-only page, plan mode, `claude -p`, an Esc), so a failure isn't retried on every tool call.
+async function db($: EngineInterface, input: DataInput) {
+  if (off) return undefined
+  const r = await $.tool.call({ tool: 'ArtifactData', ...input } as never).catch(() => undefined)
+  const ok = r !== undefined && r.deny === undefined && !r.isError
+  off = !ok
+  return ok ? r : undefined
+}
+// Makes this session's row on page `url` in the first color no live session there has, named for folder `dir` (with
+// a number while a live one has that name), and deletes the helper rows a plugin reload lost track of.
+async function arrive($: EngineInterface, url: string, dir: string, now: number) {
+  const id = await $.session.id()
+  const all = docs((await db($, { action: 'list', url, collection: AGENTS }))?.text)
+  const own = all.find(d => d.id === id) // left by this session before a plugin reload
+  const live = all.filter(d => d !== own && d.data.parent === undefined && now - Date.parse(String(d.data.seen)) < LIVE)
+  const names = new Set(live.map(d => d.data.name))
+  const base = dir.slice(dir.lastIndexOf('/') + 1) || dir
+  let name = base
+  for (let n = 2; names.has(name); n++) name = `${base} ${n}`
+  // ponytail: the page has three agent colors, so a fourth live session shares one; add colors if that bites.
+  const color = [1, 2, 3].find(c => !live.some(d => d.data.color === c)) ?? (live.length % 3) + 1
+  const step = last?.url === url ? last.step : null
+  const data = { name, color, step, seen: new Date(now).toISOString() }
+  const ver = version(await db($, { action: 'set', url, collection: AGENTS, doc_id: id, data, if_version: own?.version }))
+  if (ver === undefined) return
+  spot = { id, ver, url, color, step, seen: now }
+  helpers.clear() // their rows go just below; each comes back with its helper's next tool call
+  const lost = all.filter(d => d.id.startsWith(`${id}~`))
+  if (lost.length)
+    await db($, {
+      action: 'batch',
+      url,
+      writes: lost.map(d => ({ op: 'delete' as const, collection: AGENTS, doc_id: d.id, if_version: d.version })),
+    })
+}
+// Writes `data` into this session's row, seen now. On a failure the row is forgotten, and the next call makes it again.
+async function mark($: EngineInterface, data: { step?: string | null }, now: number) {
+  const s = spot
+  if (!s) return
+  const seen = new Date(now).toISOString()
+  const ver = version(
+    await db($, { action: 'update', url: s.url, collection: AGENTS, doc_id: s.id, data: { ...data, seen }, if_version: s.ver }),
+  )
+  spot = ver === undefined ? undefined : { ...s, ...data, ver, seen: now }
+}
+// Makes the row of helper `agentId`, named for its type (`executor` for `oh-my-claudecode:executor`).
+async function help($: EngineInterface, agentId: string, now: number) {
+  const s = spot
+  if (!s || helpers.has(agentId)) return
+  const type = (await $.agent.list()).find(a => a.id === agentId)?.type
+  if (type === undefined) return // a loop the engine runs for itself (memory, compaction) is no helper
+  const id = `${s.id}~${agentId.replace(/[^\w\-.~:@+]/g, '_')}`.slice(0, 200)
+  const data = { name: type.slice(type.lastIndexOf(':') + 1), color: s.color, parent: s.id, seen: new Date(now).toISOString() }
+  const ver = version(await db($, { action: 'set', url: s.url, collection: AGENTS, doc_id: id, data }))
+  if (ver !== undefined) helpers.set(agentId, { id, ver })
+}
+async function unhelp($: EngineInterface, agentId: string) {
+  const h = helpers.get(agentId)
+  if (!h || !spot) return
+  helpers.delete(agentId)
+  await db($, { action: 'delete', url: spot.url, collection: AGENTS, doc_id: h.id, if_version: h.ver })
+}
+// Deletes this session's rows.
+// ponytail: rows a session left mid-turn (a crash, an exit with a helper at work) stay in the collection; the page
+// hides them once they are 30 minutes old. Sweep old rows at arrival if the collection grows.
+async function leave($: EngineInterface) {
+  const s = spot
+  if (!s) return
+  const rows = [s, ...helpers.values()]
+  spot = undefined
+  last = { url: s.url, step: s.step }
+  helpers.clear()
+  await db($, {
+    action: 'batch',
+    url: s.url,
+    writes: rows.map(r => ({ op: 'delete' as const, collection: AGENTS, doc_id: r.id, if_version: r.ver })),
+  })
+}
+// After a tool call: the session's row on its roadmap page, at the step it marked, seen lately, with its helpers'.
+// Its roadmap is the one it works on in the folder the main loop last worked in, else where a helper last did.
+async function present($: EngineInterface, e: ToolCallInput) {
+  if (off) return
+  const dir = here ?? away
+  const mine = targets((await load($)).filter(m => m.dir === dir))
+  const url = mine.length === 1 ? mine[0]?.url : undefined // ponytail: no row while a folder's roadmaps have no pick
+  if (spot && spot.url !== url) await leave($)
+  if (!url || dir === undefined) return
+  const now = await $.clock.now()
+  if (!spot) await arrive($, url, dir, now)
+  if (!spot) return
+  const step = stepOf(e, url, spot.step)
+  if (step !== undefined && step !== spot.step) await mark($, { step }, now)
+  else if (now - spot.seen >= FRESH) await mark($, {}, now)
+  if (e.agentId !== undefined) await help($, e.agentId, now)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     folder = await $.session.root()
     home = (await $.env.get('HOME')) ?? ''
     here = undefined
-    for (const s of [picks, heard, raised, told]) s.clear()
+    for (const s of [picks, heard, raised, told, helpers]) s.clear()
     recent.length = 0
+    ;[spot, away, off, busy, last] = [undefined, undefined, false, false, undefined]
     await $.command.register({
       name: 'roadmap',
       description: 'Show, link, move, pick or unlink the roadmaps of your folders',
@@ -298,75 +451,124 @@ export const register: Register = on => {
   })
 
   on('tool.call', async ($, e, next) => {
+    if (next.origin.plugin === $.plugin.name) return next(e) // the mod's own agent rows are no work on the roadmap
     const cwd = e.tool === 'Bash' ? await $.session.cwd() : '' // where the command starts, before a `cd` in it
     const ran = await next(e)
     // ponytail: a pipe exits as its last stage does, so `git commit … | tail -3` counts even when the commit fails;
     // reading git's `[branch sha]` line would catch it, unless the tail cuts it off.
     if (ran.deny !== undefined || ran.isError) return ran
-    const maps = await load($)
+    try {
+      const maps = await load($)
 
-    // The project-roadmap skill publishes roadmap.html with the map icon; a republish of a linked page syncs it.
-    // ponytail: a republish by a code/ url stores the short url the publish prints, so another session working on
-    // the code/ url loses its pick; keep the old url as an alias if that bites.
-    if (e.tool === 'Artifact' && (e.action ?? 'publish') === 'publish' && !e.asset) {
-      const url = urlIn(ran.text)
-      const linked = urlIn(e.url)
-      const old = maps.find(r => r.url === url || r.url === linked)
-      if (url && (old || (e.icon === 'map' && /roadmap[^/]*\.html$/i.test(e.file_path ?? '')))) {
-        const title = (await titleOf($, e.file_path)) ?? old?.title
-        const r = { url, title, behind: 0, dir: old?.dir ?? (await workDir($)) }
-        await keep($, maps, r, old)
-        if (old) return ran
-        $.ui.toast(`Roadmap added for ${short(r.dir)}: ${title ?? url}`)
-        told.add(r.dir)
-        const text = `Roadmap ${name(r)} now covers ${short(r.dir)}: milestones there count toward it.${await noRepo($, r)} If its work lives in another folder, the user can move it with /roadmap link ${url} <folder>.`
-        return { ...ran, context: [...(ran.context ?? []), text] }
+      // The project-roadmap skill publishes roadmap.html with the map icon; a republish of a linked page syncs it.
+      // ponytail: a republish by a code/ url stores the short url the publish prints, so another session working on
+      // the code/ url loses its pick; keep the old url as an alias if that bites.
+      if (e.tool === 'Artifact' && (e.action ?? 'publish') === 'publish' && !e.asset) {
+        const url = urlIn(ran.text)
+        const linked = urlIn(e.url)
+        const old = maps.find(r => r.url === url || r.url === linked)
+        if (url && (old || (e.icon === 'map' && /roadmap[^/]*\.html$/i.test(e.file_path ?? '')))) {
+          const title = (await titleOf($, e.file_path)) ?? old?.title
+          const r = { url, title, behind: 0, dir: old?.dir ?? (await workDir($)) }
+          await keep($, maps, r, old)
+          if (old) return ran
+          $.ui.toast(`Roadmap added for ${short(r.dir)}: ${title ?? url}`)
+          told.add(r.dir)
+          const text = `Roadmap ${name(r)} now covers ${short(r.dir)}: milestones there count toward it.${await noRepo($, r)} If its work lives in another folder, the user can move it with /roadmap link ${url} <folder>.`
+          return { ...ran, context: [...(ran.context ?? []), text] }
+        }
       }
-    }
 
-    const shell = e.tool === 'Bash' ? foldersOf(e.command, cwd) : undefined
-    const file = fileDir(e)
-    const seen = shell?.all ?? (file ? [file] : [])
-    touch(seen)
-    if (!maps.length) return ran
+      const shell = e.tool === 'Bash' ? foldersOf(e.command, cwd) : undefined
+      const file = fileDir(e)
+      const seen = shell?.all ?? (file ? [file] : [])
+      touch(seen)
+      if (!maps.length) return ran
 
-    if (e.tool === 'ArtifactData' && WRITES.includes(e.action)) {
-      const url = urlIn(e.url)
-      const old = maps.find(r => r.url === url)
-      if (old) {
-        await keep($, maps, { ...old, behind: 0 }, old)
+      if (e.tool === 'ArtifactData' && WRITES.includes(e.action)) {
+        const url = urlIn(e.url)
+        const old = maps.find(r => r.url === url)
+        if (old) {
+          await keep($, maps, { ...old, behind: 0 }, old)
+          return ran
+        }
+      }
+      let now = maps
+      const hit = new Set<Roadmap>()
+      for (const d of await reals($, shell?.milestones ?? [])) for (const r of targets(await at($, maps, d))) hit.add(r)
+      if (hit.size) {
+        for (const r of hit) raised.add(r.url)
+        now = maps.map(r => (hit.has(r) ? { ...r, behind: r.behind + 1 } : r))
+        await save($, now)
+      }
+      if (e.agentId !== undefined) {
+        for (const d of await reals($, seen)) away = (await at($, now, d))[0]?.dir ?? away
         return ran
       }
-    }
-    let now = maps
-    const hit = new Set<Roadmap>()
-    for (const d of await reals($, shell?.milestones ?? [])) for (const r of targets(await at($, maps, d))) hit.add(r)
-    if (hit.size) {
-      for (const r of hit) raised.add(r.url)
-      now = maps.map(r => (hit.has(r) ? { ...r, behind: r.behind + 1 } : r))
-      await save($, now)
-    }
-    if (e.agentId !== undefined) return ran
 
-    // The pointer of each roadmap folder the main loop starts working in, then the nudge.
-    const texts: string[] = []
-    for (const d of await reals($, seen)) {
-      const mine = await at($, now, d)
-      const dir = mine[0]?.dir
-      if (dir === undefined) continue
-      if (here !== dir) {
-        here = dir
-        show($, now)
+      // The pointer of each roadmap folder the main loop starts working in, then the nudge.
+      const texts: string[] = []
+      for (const d of await reals($, seen)) {
+        const mine = await at($, now, d)
+        const dir = mine[0]?.dir
+        if (dir === undefined) continue
+        if (here !== dir) {
+          here = dir
+          show($, now)
+        }
+        if (told.has(dir)) continue
+        told.add(dir)
+        for (const m of mine) heard.set(m.url, m.behind)
+        texts.push(pointer(now, mine))
       }
-      if (told.has(dir)) continue
-      told.add(dir)
-      for (const m of mine) heard.set(m.url, m.behind)
-      texts.push(pointer(now, mine))
-    }
-    const text = news(now)
-    if (text) texts.push(text)
+      const text = news(now)
+      if (text) texts.push(text)
 
-    return texts.length ? { ...ran, context: [...(ran.context ?? []), ...texts] } : ran
+      return texts.length ? { ...ran, context: [...(ran.context ?? []), ...texts] } : ran
+    } finally {
+      await later($, () => present($, e)) // after the folder and picks above moved, while this hook runs (see `later`)
+    }
+  })
+
+  // The mod's own ArtifactData calls: its agent rows on the pages in the list are OK'd, as the person agreed, where the
+  // engine's own check would ask; any other is refused. The engine then counts this mod's later writes as approved for the
+  // session, for this mod alone (checked live). Others' calls keep their verdict.
+  on('tool.check', { tool: 'ArtifactData' }, async ($, e, next) => {
+    const r = await next(e)
+    if (next.origin.plugin !== $.plugin.name) return r
+    const i = e.input as { url?: unknown; action?: unknown; collection?: unknown; writes?: { collection?: unknown }[] }
+    const rows = i.action === 'batch' ? Array.isArray(i.writes) && i.writes.every(w => w?.collection === AGENTS) : i.collection === AGENTS
+    if (!rows || !(await load($)).some(m => m.url === i.url))
+      return { decision: 'deny', reason: 'roadmap-keeper writes only its agent rows, on the roadmap pages in its list.' }
+    // An ask from a rule, a settings hook, another mod or an option stays: the person or that guard decides.
+    const theirs = r.rule ?? r.hook ?? r.plugin ?? r.setting
+    return r.decision === 'ask' && theirs === undefined
+      ? { decision: 'allow', reason: 'roadmap-keeper: its agent rows on a linked roadmap page' }
+      : r
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) [busy, off] = [true, false]
+    return next(e)
+  })
+
+  // A helper's row goes with its turn, and the session's once the main loop's turn and every helper are done.
+  on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
+    const id = e.agentId
+    if (id === undefined) busy = false
+    await later($, async () => {
+      if (id !== undefined) await unhelp($, id)
+      if (!busy && !helpers.size) await leave($)
+    })
+    return r
+  })
+
+  // A /clear goes on under a new session id, with no session.start: the next row is made for that one.
+  on('session.end', async ($, e, next) => {
+    ;[spot, away, off, busy, last] = [undefined, undefined, false, false, undefined]
+    helpers.clear()
+    return next(e)
   })
 
   on('command.run', { command: 'roadmap' }, async ($, e) => {
