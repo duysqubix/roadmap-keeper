@@ -72,6 +72,7 @@ const engine = (on: On, roadmaps?: unknown, { key = KEY, root = APP_DIR, data = 
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('classic.SessionStart', () => ({}))
   on('classic.UserPromptSubmit', () => ({}))
+  on('skill.prompt', (_, e) => ({ text: e.text })) // the skill's text as its file computes it
   const pages = new Map<string, Map<string, { data: object; version: number }>>()
   let tries = 0
   on('session.id', () => ({ value: 'me1' }))
@@ -636,4 +637,33 @@ test('without the ArtifactData tool, as under claude -p, the rows try once a tur
   await bash($, 'ls')
   await clock.settle()
   expect(tries()).toBe(2)
+})
+
+test("a named session's new roadmap takes the session's name as its title", async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: HOME, surface: 'terminal', isInteractive: true })
+  const skill = async (name = 'project-roadmap') => (await $.skill.prompt({ skill: name, text: 'Build the page.' })).text
+  await $.classic.SessionStart({ source: 'startup' })
+  expect(await skill()).toBe('Build the page.')
+  // A /rename shows at the next prompt; a prompt whose payload leaves the field out keeps the name.
+  await $.classic.UserPromptSubmit({ prompt: 'go', session_title: 'Pulse Cloud Blue-Green' })
+  await $.classic.UserPromptSubmit({ prompt: 'and?' })
+  expect(await skill()).toBe(
+    'This session is named "Pulse Cloud Blue-Green". If you make a new roadmap, use that name as its title, word for word, without adding "Roadmap". When you update or republish a roadmap that already exists, keep its title.\n\nBuild the page.',
+  )
+  expect(await skill('commit')).toBe('Build the page.')
+  await $.classic.UserPromptSubmit({ prompt: 'go', session_title: 'Cutover' })
+  expect(await skill()).toContain('named "Cutover"')
+  // A subagent's hooks don't name the session.
+  await $.classic.UserPromptSubmit({ prompt: 'go', session_title: 'helper', agent_id: 'a1' })
+  await $.classic.SessionStart({ source: 'startup', session_title: 'helper', agent_id: 'a1' })
+  expect(await skill()).toContain('named "Cutover"')
+  // A compaction or a fork keeps the name when its payload leaves it out; a /clear or a resume takes the payload's.
+  await $.classic.SessionStart({ source: 'compact' })
+  await $.classic.SessionStart({ source: 'fork' })
+  expect(await skill()).toContain('named "Cutover"')
+  await $.classic.SessionStart({ source: 'clear' })
+  expect(await skill()).toBe('Build the page.')
+  await $.classic.SessionStart({ source: 'resume', session_title: 'Kitchen Remodel' })
+  expect(await skill()).toContain('named "Kitchen Remodel"')
 })

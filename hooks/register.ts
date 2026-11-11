@@ -31,6 +31,8 @@ const heard = new Map<string, number>() // per url, the `behind` count the main 
 const raised = new Set<string>() // the urls this session's milestones counted toward
 const told = new Set<string>() // the roadmap folders whose pointer the agent has in its context
 const recent: string[] = [] // the folders this session's tool calls touched lately, newest last, as written
+let named: string | undefined // the session's name (/rename, --name), as the start and prompt hooks last carried it
+// ponytail: a plugin reload forgets the name until the next prompt (seen live); keep it in $.state if that bites.
 
 const urlIn = (text?: string) => text?.match(ARTIFACT_URL)?.[0]
 // The command without heredoc bodies and quoted text, so a commit message or a grep pattern is no milestone.
@@ -426,7 +428,9 @@ export const register: Register = on => {
     if (e.source !== 'compact' && e.source !== 'fork') {
       picks.clear()
       here = undefined
+      named = undefined
     }
+    named = e.session_title ?? named
     told.clear()
     const maps = await load($)
     const mine =
@@ -445,9 +449,22 @@ export const register: Register = on => {
   on('classic.UserPromptSubmit', async ($, e, next) => {
     const r = await next(e)
     if (r.block || e.agent_id) return r
+    named = e.session_title ?? named // a /rename shows at the next prompt (seen live); a payload may leave the field out
     const text = news(await load($))
 
     return text ? { ...r, additionalContext: [...(r.additionalContext ?? []), text] } : r
+  })
+
+  // A named session's new roadmap takes the session's name as its title. An unnamed session's title comes from the
+  // skill, and the auto title Claude Code gives a session never reaches these hooks (seen live). The line goes first:
+  // after the text's closing `ARGUMENTS:` line, the model read it as the user's words (seen live).
+  on('skill.prompt', { skill: 'project-roadmap' }, async ($, e, next) => {
+    const r = await next(e)
+    return named
+      ? {
+          text: `This session is named "${named}". If you make a new roadmap, use that name as its title, word for word, without adding "Roadmap". When you update or republish a roadmap that already exists, keep its title.\n\n${r.text}`,
+        }
+      : r
   })
 
   on('tool.call', async ($, e, next) => {
